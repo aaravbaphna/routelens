@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "routelens"
+version = "0.1.0"
+description = "See why LiteLLM picked each model, on every turn. A drop-in observability dashboard for LiteLLM routing."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Aarav Baphna" }]
+keywords = ["litellm", "llm", "routing", "observability", "dashboard", "proxy"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = ["litellm"]
+
+[project.optional-dependencies]
+# Only needed for `routelens serve` / `routelens demo --serve` run standalone,
+# outside a LiteLLM proxy (which already ships fastapi + uvicorn itself).
+serve = ["fastapi", "uvicorn"]
+dev = ["pytest", "httpx", "fastapi", "uvicorn"]
+
+[project.urls]
+Homepage = "https://github.com/aaravbaphna/routelens"
+Issues = "https://github.com/aaravbaphna/routelens/issues"
+
+[project.scripts]
+routelens = "routelens.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+routelens = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

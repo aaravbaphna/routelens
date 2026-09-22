@@ -1,0 +1,37 @@
+# Example LiteLLM proxy config with RouteLens installed.
+#
+#   pip install routelens
+#   routelens install --config examples/config.yaml --patch
+#   litellm --config examples/config.yaml
+#
+# `routelens install` is what writes routelens_callback.py and the
+# `callbacks: routelens_callback.instance` line below — it's checked in here
+# already so this file runs as-is if you just want to see it work.
+
+model_list:
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: claude-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # Two deployments under one name: RouteLens will show which one was picked,
+  # and why, on every call.
+  - model_name: chat
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: chat
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+router_settings:
+  routing_strategy: latency-based-routing
+
+litellm_settings:
+  callbacks: routelens_callback.instance

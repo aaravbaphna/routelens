@@ -80,3 +80,115 @@ def test_retention_prunes_old_rows(tmp_path):
     s.flush()
     assert [x["session_id"] for x in s.sessions(0)] == ["b"]
     s.close()
+
+
+def mod_row(session, request, ts, chain="input", status="pass", categories=None, key_alias="k", **kw):
+    r = {"id": uuid.uuid4().hex, "request_id": request, "session_id": session, "session_source": "explicit",
+         "ts": ts, "chain": chain, "status": status, "categories": categories or [], "scores": {},
+         "reason": "r", "latency_ms": 50.0, "preview": None, "key_alias": key_alias}
+    r.update(kw)
+    return r
+
+
+def test_blocked_at_input_turn_has_no_attempts_row_but_still_shows_up(store):
+    now = time.time()
+    store.record_moderation(mod_row("s1", "r1", now, chain="input", status="blocked",
+                                     categories=["violence"], preview="bad prompt"))
+    store.flush()
+    d = store.session("s1")
+    [turn] = d["turns"]
+    assert turn["status"] == "blocked" and turn["final"] is None and turn["attempts"] == []
+    assert turn["preview"] == "bad prompt"
+    [s] = store.sessions(now - 3600)
+    assert s["turns"] == 1 and s["blocked"] == 1
+    assert s["path"] == [{"provider": None, "model": None, "status": "blocked"}]
+
+
+def test_output_blocked_turn_keeps_its_successful_attempt_but_is_marked_blocked(store):
+    now = time.time()
+    store.record(row("s1", "r1", now - 1, model="a"))
+    store.record_moderation(mod_row("s1", "r1", now, chain="output", status="blocked", categories=["sexual"]))
+    store.flush()
+    d = store.session("s1")
+    [turn] = d["turns"]
+    assert turn["status"] == "blocked" and turn["final"]["model"] == "a"  # the attempt itself still succeeded
+    [s] = store.sessions(now - 3600)
+    assert s["path"][0]["status"] == "blocked" and s["path"][0]["model"] == "a"
+
+
+def test_a_passing_moderation_check_does_not_mark_the_turn_blocked(store):
+    now = time.time()
+    store.record(row("s1", "r1", now - 1, model="a"))
+    store.record_moderation(mod_row("s1", "r1", now, chain="input", status="pass"))
+    store.record_moderation(mod_row("s1", "r1", now, chain="output", status="pass"))
+    store.flush()
+    d = store.session("s1")
+    [turn] = d["turns"]
+    assert turn["status"] == "success"
+
+
+def test_mixed_session_orders_turns_by_time_across_both_tables(store):
+    now = time.time()
+    store.record_moderation(mod_row("s1", "r1", now - 20, chain="input", status="blocked"))
+    store.record(row("s1", "r2", now - 10, model="a"))
+    store.record_moderation(mod_row("s1", "r3", now, chain="input", status="blocked"))
+    store.flush()
+    d = store.session("s1")
+    assert [t["request_id"] for t in d["turns"]] == ["r1", "r2", "r3"]
+    assert [t["turn"] for t in d["turns"]] == [1, 2, 3]
+    [s] = store.sessions(now - 3600)
+    assert s["turns"] == 3 and s["blocked"] == 2
+    assert [p["status"] for p in s["path"]] == ["blocked", "success", "blocked"]
+
+
+def test_session_source_falls_back_to_moderation_when_there_are_no_attempts(store):
+    now = time.time()
+    store.record_moderation(mod_row("s1", "r1", now, chain="input", status="blocked"))
+    store.flush()
+    d = store.session("s1")
+    assert d["session_source"] == "explicit"
+
+
+def test_moderation_overview_totals_and_category_breakdown(store):
+    now = time.time()
+    store.record_moderation(mod_row("s1", "r1", now, chain="input", status="pass"))
+    store.record_moderation(mod_row("s1", "r2", now, chain="input", status="blocked", categories=["violence"]))
+    store.record_moderation(mod_row("s1", "r2", now, chain="output", status="blocked", categories=["violence", "sexual"]))
+    store.record_moderation(mod_row("s1", "r3", now, chain="output", status="error"))
+    store.flush()
+    o = store.moderation_overview(now - 3600, 60)
+    assert o["totals"]["checked"] == 4 and o["totals"]["blocked"] == 2 and o["totals"]["errors"] == 1
+    assert o["totals"]["block_rate"] == pytest.approx(0.5)
+    by_chain = {c["chain"]: c for c in o["by_chain"]}
+    assert by_chain["input"]["checked"] == 2 and by_chain["input"]["blocked"] == 1
+    assert by_chain["output"]["checked"] == 2 and by_chain["output"]["blocked"] == 1
+    cats = {c["category"]: c["n"] for c in o["by_category"]}
+    assert cats == {"violence": 2, "sexual": 1}
+
+
+def test_moderation_overview_filters_by_chain(store):
+    now = time.time()
+    store.record_moderation(mod_row("s1", "r1", now, chain="input", status="blocked", categories=["a"]))
+    store.record_moderation(mod_row("s1", "r2", now, chain="output", status="pass"))
+    store.flush()
+    o = store.moderation_overview(now - 3600, 60, chain="input")
+    assert o["totals"]["checked"] == 1 and o["totals"]["blocked"] == 1
+
+
+def test_moderation_recent_blocked_only(store):
+    now = time.time()
+    store.record_moderation(mod_row("s1", "r1", now - 2, status="pass"))
+    store.record_moderation(mod_row("s1", "r2", now - 1, status="blocked"))
+    store.flush()
+    recent = store.moderation_recent(blocked_only=True)
+    assert [r["request_id"] for r in recent] == ["r2"]
+
+
+def test_moderation_for_requests_groups_by_request_id(store):
+    now = time.time()
+    store.record_moderation(mod_row("s1", "r1", now, chain="input", status="pass"))
+    store.record_moderation(mod_row("s1", "r1", now, chain="output", status="blocked"))
+    store.record_moderation(mod_row("s1", "r2", now, chain="input", status="pass"))
+    store.flush()
+    grouped = store.moderation_for_requests(["r1", "r2", "r9"])
+    assert len(grouped["r1"]) == 2 and len(grouped["r2"]) == 1 and "r9" not in grouped

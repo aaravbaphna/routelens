@@ -88,3 +88,39 @@ def test_explicit_session_id_wins_and_turns_stay_separate(lens):
     assert s["session_id"] == "S-1" and s["session_source"] == "explicit"
     # a shared trace id (what x-litellm-session-id produces in the proxy) must not merge separate turns
     assert s["turns"] == 3
+
+
+def test_output_moderation_blocks_a_flagged_response_end_to_end(tmp_path):
+    """async_post_call_success_deployment_hook (unlike pre_call_hook) fires for a bare SDK
+    Router too, so this is the one moderation path testable without a real proxy process."""
+    from routelens.moderation import ModerationResult
+
+    class FlagsWord(object):
+        enabled = True
+
+        async def check(self, text):
+            return ModerationResult(flagged=("BLOCKED_WORD" in text))
+
+    saved = litellm.callbacks
+    m = RouteLens(db_path=str(tmp_path / "out_mod.db"), mount=False,
+                  moderation_enabled=True, moderation_checker=FlagsWord())
+    litellm.callbacks = [m]
+    r = Router(model_list=[
+        {"model_name": "chat", "litellm_params": {"model": "openai/ok", "api_key": "x", "mock_response": "clean reply"}},
+        {"model_name": "flagged", "litellm_params": {"model": "openai/bad", "api_key": "x", "mock_response": "contains BLOCKED_WORD here"}},
+    ])
+
+    async def go():
+        clean = await r.acompletion(model="chat", messages=[{"role": "user", "content": "hi"}])
+        with pytest.raises(litellm.BadRequestError):
+            await r.acompletion(model="flagged", messages=[{"role": "user", "content": "hi"}])
+        return clean
+    try:
+        clean = asyncio.run(go())
+        assert clean.choices[0].message.content == "clean reply"
+        m.store.flush()
+        statuses = sorted(e["status"] for e in m.store.moderation_recent())
+        assert statuses == ["blocked", "pass"]
+    finally:
+        litellm.callbacks = saved
+        m.store.close()

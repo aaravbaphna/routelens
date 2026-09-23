@@ -47,7 +47,7 @@ async def require_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 
-def build_router(store: Store) -> APIRouter:
+def build_router(store: Store, moderation_enabled: bool = False, moderation_mode: str = "enforce") -> APIRouter:
     r = APIRouter()
 
     def window(w: str) -> "tuple[float, int, str]":
@@ -71,6 +71,7 @@ def build_router(store: Store) -> APIRouter:
             "providers": await asyncio.to_thread(store.providers),
             "auth_required": bool(_tokens()),
             "windows": list(WINDOWS),
+            "moderation": {"enabled": moderation_enabled, "mode": moderation_mode},
         }
 
     @r.get("/routelens/api/overview", dependencies=[Depends(require_auth)])
@@ -95,5 +96,20 @@ def build_router(store: Store) -> APIRouter:
     @r.get("/routelens/api/recent", dependencies=[Depends(require_auth)])
     async def recent(limit: int = 30) -> Any:
         return {"attempts": await asyncio.to_thread(store.recent, max(1, min(limit, 200)))}
+
+    @r.get("/routelens/api/moderation/overview", dependencies=[Depends(require_auth)])
+    async def moderation_overview(window_: str = Query("24h", alias="window"),
+                                   chain: str = "all") -> Any:
+        since, bucket, w = window(window_)
+        chain = chain if chain in ("input", "output") else "all"
+        data = await asyncio.to_thread(store.moderation_overview, since, bucket, chain)
+        data.update({"window": w, "bucket_s": bucket, "since": since, "chain": chain})
+        return data
+
+    @r.get("/routelens/api/moderation/recent", dependencies=[Depends(require_auth)])
+    async def moderation_recent(chain: str = "all", blocked_only: bool = False, limit: int = 30) -> Any:
+        chain = chain if chain in ("input", "output") else "all"
+        events = await asyncio.to_thread(store.moderation_recent, max(1, min(limit, 200)), chain, blocked_only)
+        return {"events": events}
 
     return r

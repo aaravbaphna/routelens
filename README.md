@@ -12,6 +12,9 @@ new infrastructure, and no changes to how you call your proxy.
 
 ![RouteLens overview](docs/screenshot-overview.png)
 
+RouteLens can also optionally moderate content — see [Moderation](#moderation) below — but
+that's off by default: install it with nothing else configured and it stays a pure observer.
+
 ## Why
 
 LiteLLM's `Router` already decides which deployment handles each request — by cost,
@@ -67,6 +70,54 @@ RouteLens looks for a session id in this order:
 Send an explicit session id from your client for exact grouping; inferred grouping
 is a heuristic and can occasionally over- or under-merge.
 
+## Moderation
+
+RouteLens can check every prompt and response against OpenAI's moderation endpoint and deny
+whatever fails — off by default, since that's a materially different thing from "just watch
+what happens." Turn it on with two environment variables:
+
+```bash
+ROUTELENS_MODERATION=1
+OPENAI_API_KEY=sk-...       # or ROUTELENS_MODERATION_API_KEY, if you want a separate key
+```
+
+![Moderation: a blocked-at-input turn, a clean turn, and a blocked-at-output turn, in one session](docs/screenshot-moderation.png)
+
+Every check — pass, block, or API error — is recorded, whether or not it ends up blocking
+anything, and shows up in three places:
+
+- **The Moderation page** — checked/blocked/error totals, a checks-over-time chart, a
+  blocked-by-category breakdown, and a recent-checks feed, all filterable by Input / Output /
+  All (`chainroute`'s language for this is "an iochain"; RouteLens ships exactly the two:
+  input and output).
+- **Every session** — a turn blocked at input has no model call to show at all (the request
+  never reached one), so it renders as its own short card rather than a half-filled normal one;
+  a turn blocked at output still shows the model that answered, just marked blocked.
+- **The per-turn pipeline** — prompt → input filter → model → response → output filter, as one
+  row, right on the turn card whenever moderation ran for it.
+
+**Two checks, two different hooks, on purpose:**
+
+- **Input** (before the model is ever called) runs in `async_pre_call_hook` — proxy-only, the
+  same hook already used for request-id stamping. This never fires for a bare SDK `Router`, only
+  inside a running `litellm` proxy.
+- **Output** (after the model answers, before the response reaches the caller) runs in
+  `async_post_call_success_deployment_hook` — this one fires for the proxy *and* a bare SDK
+  `Router`.
+
+Both are exactly the two hooks a plain `CustomLogger` (not the more specific `CustomGuardrail`
+subclass litellm's own guardrails framework expects) actually gets called on for every request —
+verified against a live proxy before any of this was built, not assumed from the hook names.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ROUTELENS_MODERATION` | `0` | set to `1` to turn moderation on at all |
+| `ROUTELENS_MODERATION_MODE` | `enforce` | `observe` records the real verdict on everything but never blocks — see what it would have caught before it can affect a real request |
+| `ROUTELENS_MODERATION_API_KEY` | falls back to `OPENAI_API_KEY` | |
+| `ROUTELENS_MODERATION_FAIL_OPEN` | `1` | if the moderation API call itself errors (network, auth, timeout) — as opposed to the content actually being flagged — set to `0` to deny the request rather than let it through unmoderated |
+| `ROUTELENS_MODERATION_TIMEOUT_S` | `2.0` | |
+| `ROUTELENS_MODERATION_BASE_URL` | OpenAI's moderation endpoint | point at a self-hosted or API-compatible endpoint instead |
+
 ## Configuration
 
 Everything is an environment variable on the proxy process, so no proxy config
@@ -101,13 +152,19 @@ lens.attach(router)  # lets RouteLens see every configured deployment, not just 
 RouteLens is a LiteLLM `CustomLogger`. It implements:
 
 - `async_pre_call_hook` — stamps a per-request id, so retries and fallbacks within
-  one HTTP request are told apart from the next request on a shared trace id.
+  one HTTP request are told apart from the next request on a shared trace id; also
+  where input moderation runs, if it's turned on.
 - `async_filter_deployments` — runs right before the routing strategy picks a
   winner; this is where the eligible-candidate list and the excluded ones are
   captured (it returns the list unchanged — RouteLens never affects routing).
+- `async_post_call_success_deployment_hook` — runs inline, right before the response
+  reaches the caller; where output moderation runs, if it's turned on.
 - `async_log_success_event` / `async_log_failure_event` — records the outcome and
   builds the plain-language explanation from the strategy, the candidates, and
   (for a fallback) the previous attempt's error.
+
+Moderation is the one place RouteLens can actually change the outcome of a request (denying
+it) rather than just record it — see [Moderation](#moderation) above.
 
 Writes go to SQLite through a dedicated background thread, so a slow disk never adds
 latency to a request. Reads come straight from that file. There's no separate

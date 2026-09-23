@@ -50,6 +50,28 @@ CREATE TABLE IF NOT EXISTS attempts (
 CREATE INDEX IF NOT EXISTS idx_attempts_session ON attempts(session_id, ts);
 CREATE INDEX IF NOT EXISTS idx_attempts_trace ON attempts(request_id);
 CREATE INDEX IF NOT EXISTS idx_attempts_ts ON attempts(ts);
+
+CREATE TABLE IF NOT EXISTS moderation_events (
+    id             TEXT PRIMARY KEY,
+    request_id     TEXT NOT NULL,
+    session_id     TEXT NOT NULL,
+    session_source TEXT,
+    ts             REAL NOT NULL,
+    chain          TEXT NOT NULL,  -- 'input' | 'output'
+    status         TEXT NOT NULL,  -- 'pass' | 'blocked' | 'error'
+    categories     TEXT,           -- JSON list of flagged category names
+    scores         TEXT,           -- JSON dict of category -> score
+    reason         TEXT,
+    latency_ms     REAL,
+    preview        TEXT,
+    key_alias      TEXT
+);
+-- A blocked-at-input request never gets an `attempts` row (the model is never called), so a
+-- turn's *only* record can live here -- this table must be self-sufficient for rendering a turn,
+-- not just a footnote joined onto `attempts`.
+CREATE INDEX IF NOT EXISTS idx_modevents_session ON moderation_events(session_id, ts);
+CREATE INDEX IF NOT EXISTS idx_modevents_request ON moderation_events(request_id);
+CREATE INDEX IF NOT EXISTS idx_modevents_ts ON moderation_events(ts);
 """
 
 COLUMNS = [
@@ -61,6 +83,10 @@ COLUMNS = [
     "end_user", "key_alias", "tags", "preview",
 ]
 _JSON_COLUMNS = ("reason_detail", "candidates", "excluded", "signals", "tags")
+
+MOD_COLUMNS = ["id", "request_id", "session_id", "session_source", "ts", "chain", "status",
+               "categories", "scores", "reason", "latency_ms", "preview", "key_alias"]
+_MOD_JSON_COLUMNS = ("categories", "scores")
 
 _STOP = object()
 
@@ -82,7 +108,13 @@ class Store:
     # ------------------------------------------------------------------ write
     def record(self, row: Dict[str, Any]) -> None:
         try:
-            self._q.put_nowait(row)
+            self._q.put_nowait(("attempts", row))
+        except queue.Full:
+            self.dropped += 1
+
+    def record_moderation(self, row: Dict[str, Any]) -> None:
+        try:
+            self._q.put_nowait(("moderation_events", row))
         except queue.Full:
             self.dropped += 1
 
@@ -101,12 +133,17 @@ class Store:
 
     def _run(self) -> None:
         conn = self._connect()
-        sql = "INSERT OR REPLACE INTO attempts (%s) VALUES (%s)" % (
-            ",".join(COLUMNS), ",".join("?" * len(COLUMNS)))
+        sqls = {
+            "attempts": "INSERT OR REPLACE INTO attempts (%s) VALUES (%s)" % (
+                ",".join(COLUMNS), ",".join("?" * len(COLUMNS))),
+            "moderation_events": "INSERT OR REPLACE INTO moderation_events (%s) VALUES (%s)" % (
+                ",".join(MOD_COLUMNS), ",".join("?" * len(MOD_COLUMNS))),
+        }
         while True:
             item = self._q.get()
-            batch: List[Dict[str, Any]] = []
+            batches: Dict[str, List[Dict[str, Any]]] = {"attempts": [], "moderation_events": []}
             events: List[threading.Event] = []
+            n = 0
             while True:
                 if item is _STOP:
                     conn.close()
@@ -114,17 +151,23 @@ class Store:
                 if isinstance(item, threading.Event):
                     events.append(item)
                 else:
-                    batch.append(item)
-                if len(batch) >= 200:
+                    table, row = item
+                    batches[table].append(row)
+                    n += 1
+                if n >= 200:
                     break
                 try:
                     item = self._q.get_nowait()
                 except queue.Empty:
                     break
             try:
-                if batch:
-                    conn.executemany(sql, [self._to_params(r) for r in batch])
-                    conn.commit()
+                if batches["attempts"]:
+                    conn.executemany(sqls["attempts"], [self._to_params(r, COLUMNS, _JSON_COLUMNS)
+                                                         for r in batches["attempts"]])
+                if batches["moderation_events"]:
+                    conn.executemany(sqls["moderation_events"], [self._to_params(r, MOD_COLUMNS, _MOD_JSON_COLUMNS)
+                                                                  for r in batches["moderation_events"]])
+                conn.commit()
                 self._maybe_prune(conn)
             except Exception:  # never let the writer thread die
                 try:
@@ -135,11 +178,11 @@ class Store:
                 e.set()
 
     @staticmethod
-    def _to_params(row: Dict[str, Any]) -> list:
+    def _to_params(row: Dict[str, Any], columns: List[str], json_columns: tuple) -> list:
         out = []
-        for c in COLUMNS:
+        for c in columns:
             v = row.get(c)
-            if c in _JSON_COLUMNS and v is not None:
+            if c in json_columns and v is not None:
                 v = json.dumps(v, default=str)
             out.append(v)
         return out
@@ -149,7 +192,9 @@ class Store:
         if now - self._last_prune < 3600:
             return
         self._last_prune = now
-        conn.execute("DELETE FROM attempts WHERE ts < ?", (now - self.retention_days * 86400,))
+        cutoff = now - self.retention_days * 86400
+        conn.execute("DELETE FROM attempts WHERE ts < ?", (cutoff,))
+        conn.execute("DELETE FROM moderation_events WHERE ts < ?", (cutoff,))
         conn.commit()
 
     def close(self) -> None:
@@ -168,7 +213,10 @@ class Store:
     @staticmethod
     def _from_row(r: sqlite3.Row) -> Dict[str, Any]:
         d = dict(r)
-        for c in _JSON_COLUMNS:
+        # A row is either an `attempts` row or a `moderation_events` row, never both, so checking
+        # the union of both tables' JSON column names against whichever columns this row actually
+        # has is safe -- a missing key is just falsy and skipped.
+        for c in _JSON_COLUMNS + _MOD_JSON_COLUMNS:
             if d.get(c):
                 try:
                     d[c] = json.loads(d[c])
@@ -215,17 +263,106 @@ class Store:
             "by_model": by_model, "by_reason": by_reason, "series": series,
         }
 
+    def moderation_overview(self, since: float, bucket_s: int, chain: str = "all") -> Dict[str, Any]:
+        params: tuple = (since,)
+        where = "ts >= ?"
+        if chain in ("input", "output"):
+            where += " AND chain = ?"
+            params = (since, chain)
+        conn = self._connect()
+        try:
+            t = conn.execute(
+                "SELECT COUNT(*) AS checked, COALESCE(SUM(status='blocked'),0) AS blocked, "
+                "COALESCE(SUM(status='error'),0) AS errors, AVG(latency_ms) AS avg_latency_ms "
+                "FROM moderation_events WHERE " + where, params).fetchone()
+            by_chain = [dict(r) for r in conn.execute(
+                "SELECT chain, COUNT(*) AS checked, COALESCE(SUM(status='blocked'),0) AS blocked "
+                "FROM moderation_events WHERE ts >= ? GROUP BY chain", (since,))]
+            cats: Dict[str, int] = {}
+            for r in conn.execute("SELECT categories FROM moderation_events WHERE " + where +
+                                   " AND status='blocked'", params):
+                for c in (json.loads(r[0]) if r[0] else []):
+                    cats[c] = cats.get(c, 0) + 1
+            by_category = sorted(({"category": k, "n": v} for k, v in cats.items()), key=lambda x: -x["n"])
+            series = [dict(r) for r in conn.execute(
+                "SELECT CAST(ts / ? AS INTEGER) * ? AS t, COUNT(*) AS n, COALESCE(SUM(status='blocked'),0) AS blocked "
+                "FROM moderation_events WHERE " + where + " GROUP BY t ORDER BY t",
+                (bucket_s, bucket_s) + params)]
+        finally:
+            conn.close()
+        checked = t["checked"] or 0
+        return {
+            "totals": {"checked": checked, "blocked": t["blocked"], "errors": t["errors"],
+                       "block_rate": (t["blocked"] / checked) if checked else 0.0,
+                       "avg_latency_ms": t["avg_latency_ms"]},
+            "by_chain": by_chain, "by_category": by_category, "series": series,
+        }
+
+    def moderation_recent(self, limit: int = 40, chain: str = "all", blocked_only: bool = False) -> List[Dict[str, Any]]:
+        where, params = [], []
+        if chain in ("input", "output"):
+            where.append("chain = ?"); params.append(chain)
+        if blocked_only:
+            where.append("status = 'blocked'")
+        sql = "SELECT * FROM moderation_events"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY ts DESC LIMIT ?"
+        params.append(limit)
+        return self._rows(sql, tuple(params))
+
+    def moderation_for_requests(self, request_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Every moderation event for a set of turns, grouped by request_id -- used to merge
+        into `session()`'s per-turn structure."""
+        if not request_ids:
+            return {}
+        marks = ",".join("?" * len(request_ids))
+        rows = self._rows(
+            "SELECT * FROM moderation_events WHERE request_id IN (%s) ORDER BY ts" % marks,
+            tuple(request_ids))
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            out.setdefault(r["request_id"], []).append(r)
+        return out
+
     def sessions(self, since: float, limit: int = 50, q: Optional[str] = None) -> List[Dict[str, Any]]:
         like = "%" + q + "%" if q else None
-        where = "ts >= ?" + (" AND (session_id LIKE ? OR model LIKE ? OR preview LIKE ?)" if like else "")
-        params: tuple = (since, like, like, like) if like else (since,)
-        heads = self._rows(
-            "SELECT session_id, MAX(session_source) AS session_source, COUNT(DISTINCT request_id) AS turns, "
+        a_where = "ts >= ?" + (" AND (session_id LIKE ? OR model LIKE ? OR preview LIKE ?)" if like else "")
+        a_params: tuple = (since, like, like, like) if like else (since,)
+        a_heads = self._rows(
+            "SELECT session_id, session_source, COUNT(DISTINCT request_id) AS turns, "
             "MIN(ts) AS first_ts, MAX(ts) AS last_ts, COALESCE(SUM(cost),0) AS cost, "
             "COUNT(DISTINCT CASE WHEN attempt_no>0 THEN request_id END) AS rerouted, "
             "COALESCE(SUM(status='failure'),0) AS failed_attempts, MAX(key_alias) AS key_alias "
-            "FROM attempts WHERE " + where + " GROUP BY session_id ORDER BY last_ts DESC LIMIT ?",
-            params + (limit,))
+            "FROM attempts WHERE " + a_where + " GROUP BY session_id", a_params)
+
+        # A request blocked at the input stage never gets an `attempts` row at all (the model is
+        # never called), so a session made up *only* of blocked turns must still surface here --
+        # merge in session identity from moderation_events too, not just attempts.
+        m_where = "ts >= ?" + (" AND (session_id LIKE ? OR preview LIKE ?)" if like else "")
+        m_params: tuple = (since, like, like) if like else (since,)
+        m_heads = self._rows(
+            "SELECT session_id, session_source, MIN(ts) AS first_ts, MAX(ts) AS last_ts, "
+            "COALESCE(SUM(status='blocked'),0) AS blocked FROM moderation_events "
+            "WHERE " + m_where + " GROUP BY session_id", m_params)
+
+        merged: Dict[str, Dict[str, Any]] = {}
+        for h in a_heads:
+            merged[h["session_id"]] = dict(h, blocked=0)
+        for h in m_heads:
+            s = merged.get(h["session_id"])
+            if s is None:
+                merged[h["session_id"]] = {
+                    "session_id": h["session_id"], "session_source": h["session_source"], "turns": 0,
+                    "first_ts": h["first_ts"], "last_ts": h["last_ts"], "cost": 0.0, "rerouted": 0,
+                    "failed_attempts": 0, "key_alias": None, "blocked": h["blocked"],
+                }
+            else:
+                s["first_ts"] = min(s["first_ts"], h["first_ts"])
+                s["last_ts"] = max(s["last_ts"], h["last_ts"])
+                s["blocked"] = h["blocked"]
+
+        heads = sorted(merged.values(), key=lambda s: -s["last_ts"])[:limit]
         if not heads:
             return []
         ids = [h["session_id"] for h in heads]
@@ -233,47 +370,92 @@ class Store:
         path_rows = self._rows(
             "SELECT session_id, request_id, ts, provider, model, status FROM attempts "
             "WHERE session_id IN (%s) ORDER BY ts" % marks, tuple(ids))
+        mod_rows = self._rows(
+            "SELECT session_id, request_id, ts, chain, status FROM moderation_events "
+            "WHERE session_id IN (%s) ORDER BY ts" % marks, tuple(ids))
+
         by_trace: Dict[str, Dict[str, Any]] = {}
         order: Dict[str, List[str]] = {}
+        trace_ts: Dict[str, float] = {}
+        seen: set = set()
+        blocked_input: set = set()
+        blocked_output: set = set()
+
+        def note(sess_id: str, req_id: str, ts: float) -> None:
+            trace_ts[req_id] = min(trace_ts.get(req_id, ts), ts)
+            if req_id not in seen:
+                seen.add(req_id)
+                order.setdefault(sess_id, []).append(req_id)
+
+        for r in mod_rows:
+            note(r["session_id"], r["request_id"], r["ts"])
+            if r["status"] == "blocked":
+                (blocked_input if r["chain"] == "input" else blocked_output).add(r["request_id"])
         for r in path_rows:
+            note(r["session_id"], r["request_id"], r["ts"])
             key = r["request_id"]
-            if key not in by_trace:
-                order.setdefault(r["session_id"], []).append(key)
-            # last successful attempt wins; otherwise keep the last attempt
-            cur = by_trace.get(key)
+            cur = by_trace.get(key)  # last successful attempt wins; otherwise keep the last attempt
             if cur is None or r["status"] == "success" or cur["status"] != "success":
                 by_trace[key] = r
+        for sid in order:
+            order[sid] = sorted(order[sid], key=lambda k: trace_ts.get(k, 0))
+
         for h in heads:
-            h["path"] = [
-                {"provider": by_trace[k]["provider"], "model": by_trace[k]["model"], "status": by_trace[k]["status"]}
-                for k in order.get(h["session_id"], [])
-            ]
-            h["switches"] = sum(
-                1 for a, b in zip(h["path"], h["path"][1:]) if a["model"] != b["model"])
+            path = []
+            for k in order.get(h["session_id"], []):
+                if k in blocked_input:
+                    path.append({"provider": None, "model": None, "status": "blocked"})
+                elif k in by_trace:
+                    r = by_trace[k]
+                    path.append({"provider": r["provider"], "model": r["model"],
+                                 "status": "blocked" if k in blocked_output else r["status"]})
+            h["path"] = path
+            h["turns"] = len(path)
+            h["switches"] = sum(1 for a, b in zip(path, path[1:]) if a["model"] != b["model"])
         return heads
 
     def session(self, session_id: str) -> Dict[str, Any]:
         rows = self._rows("SELECT * FROM attempts WHERE session_id = ? ORDER BY ts, attempt_no", (session_id,))
-        turns: List[Dict[str, Any]] = []
+        mod_rows = self._rows("SELECT * FROM moderation_events WHERE session_id = ? ORDER BY ts", (session_id,))
         idx: Dict[str, Dict[str, Any]] = {}
-        for r in rows:
-            t = idx.get(r["request_id"])
+
+        def turn_for(request_id: str, ts: float) -> Dict[str, Any]:
+            t = idx.get(request_id)
             if t is None:
-                t = {"request_id": r["request_id"], "turn": len(turns) + 1, "ts": r["ts"], "attempts": []}
-                idx[r["request_id"]] = t
-                turns.append(t)
-            t["attempts"].append(r)
-        for t in turns:
+                t = {"request_id": request_id, "ts": ts, "attempts": [],
+                     "moderation": {"input": None, "output": None}}
+                idx[request_id] = t
+            else:
+                t["ts"] = min(t["ts"], ts)
+            return t
+
+        for r in rows:
+            turn_for(r["request_id"], r["ts"])["attempts"].append(r)
+        for r in mod_rows:
+            turn_for(r["request_id"], r["ts"])["moderation"][r["chain"]] = r
+
+        turns = sorted(idx.values(), key=lambda t: t["ts"])
+        for i, t in enumerate(turns):
+            t["turn"] = i + 1
             ok = [a for a in t["attempts"] if a["status"] == "success"]
-            final = ok[-1] if ok else t["attempts"][-1]
-            t["final"] = final
-            t["status"] = "success" if ok else "failure"
+            blocked_in = t["moderation"]["input"] and t["moderation"]["input"]["status"] == "blocked"
+            blocked_out = t["moderation"]["output"] and t["moderation"]["output"]["status"] == "blocked"
+            if t["attempts"]:
+                t["final"] = ok[-1] if ok else t["attempts"][-1]
+                t["status"] = "blocked" if (blocked_in or blocked_out) else ("success" if ok else "failure")
+            else:
+                # No model was ever called -- either blocked at input, or (defensively) some
+                # other gap. Never crash the dashboard over it either way.
+                t["final"] = None
+                t["status"] = "blocked" if blocked_in else "unknown"
             t["cost"] = sum(a["cost"] or 0 for a in t["attempts"])
             t["latency_ms"] = sum(a["latency_ms"] or 0 for a in t["attempts"])
-            t["preview"] = next((a["preview"] for a in t["attempts"] if a.get("preview")), None)
+            t["preview"] = (next((a["preview"] for a in t["attempts"] if a.get("preview")), None)
+                             or (t["moderation"]["input"] or {}).get("preview"))
         return {
             "session_id": session_id,
-            "session_source": rows[0]["session_source"] if rows else None,
+            "session_source": (rows[0]["session_source"] if rows else
+                                (mod_rows[0]["session_source"] if mod_rows else None)),
             "turns": turns,
         }
 

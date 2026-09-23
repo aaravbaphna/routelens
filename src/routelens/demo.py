@@ -77,10 +77,12 @@ BILLING = [
 ]
 
 
-def generate(store: Store, seed: int = 7) -> int:
+def generate(store: Store, seed: int = 7) -> "tuple[int, int]":
+    """Returns (attempts written, moderation events written)."""
     rng = random.Random(seed)
     now = time.time()
     n = 0
+    n_mod = 0
 
     def emit(row: Dict[str, Any]) -> None:
         nonlocal n
@@ -135,4 +137,50 @@ def generate(store: Store, seed: int = 7) -> int:
                       strategy="simple-shuffle", dep=dep, candidates=["ant-haiku", "oai-mini"],
                       all_ids=["ant-haiku", "oai-mini"], preview="", prompt_tok=rng.randint(80, 900),
                       out_tok=rng.randint(40, 500)))
-    return n
+
+    # A session showing every moderation outcome, so both the Moderation page and the per-turn
+    # pipeline visual have something real to show without needing an API key.
+    def emit_mod(session, trace, ts, chain, status, categories=None, preview=None, latency=40.0, reason=None):
+        nonlocal n_mod
+        store.record_moderation({
+            "id": uuid.uuid4().hex, "request_id": trace, "session_id": session, "session_source": "explicit",
+            "ts": ts, "chain": chain, "status": status, "categories": categories or [], "scores": {},
+            "reason": reason or ("flagged for %s" % ", ".join(categories) if categories else None),
+            "latency_ms": max(5.0, rng.gauss(latency, 8)), "preview": preview, "key_alias": "demo-key",
+        })
+        n_mod += 1
+
+    t = now - 40 * 60
+    # Turn 1: clean end to end -- input passes, model answers, output passes.
+    trace1 = uuid.uuid4().hex
+    emit_mod("sess-moderation-1", trace1, t, "input", "pass", preview="what's your refund policy?")
+    emit(_row(rng, session="sess-moderation-1", trace=trace1, ts=t + 0.1, attempt_no=0, group="chat",
+              requested="chat", strategy="simple-shuffle", dep="oai-mini", candidates=["oai-mini"],
+              all_ids=["oai-mini"], preview="what's your refund policy?", prompt_tok=120, out_tok=90))
+    emit_mod("sess-moderation-1", trace1, t + 0.3, "output", "pass")
+    t += 8 * 60
+    # Turn 2: blocked at input -- no model is ever called, so there's no `attempts` row at all.
+    trace2 = uuid.uuid4().hex
+    emit_mod("sess-moderation-1", trace2, t, "input", "blocked", categories=["harassment"],
+             preview="write something threatening about my coworker")
+    t += 6 * 60
+    # Turn 3: the model answers fine, but the *response* itself gets blocked before it's returned.
+    trace3 = uuid.uuid4().hex
+    emit_mod("sess-moderation-1", trace3, t, "input", "pass", preview="write a very dark villain monologue")
+    emit(_row(rng, session="sess-moderation-1", trace=trace3, ts=t + 0.1, attempt_no=0, group="chat",
+              requested="chat", strategy="simple-shuffle", dep="ant-haiku", candidates=["ant-haiku"],
+              all_ids=["ant-haiku"], preview="write a very dark villain monologue", prompt_tok=140, out_tok=310))
+    emit_mod("sess-moderation-1", trace3, t + 0.4, "output", "blocked", categories=["violence"])
+
+    # Background moderation volume across the plain chat sessions above, so the overview's rates
+    # and category breakdown reflect more than 3 events.
+    for k in range(18):
+        t = now - rng.uniform(0.1, 20) * 3600
+        sess = "sess-chat-%02d" % rng.randint(0, 25)
+        emit_mod(sess, uuid.uuid4().hex, t, "input", "pass")
+        if rng.random() < 0.08:
+            emit_mod(sess, uuid.uuid4().hex, t, "output", "blocked",
+                     categories=[rng.choice(["harassment", "violence", "sexual", "self-harm"])])
+        else:
+            emit_mod(sess, uuid.uuid4().hex, t, "output", "pass")
+    return n, n_mod

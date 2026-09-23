@@ -110,9 +110,9 @@ def main(argv: "list[str] | None" = None) -> None:
         from .demo import generate
         from .store import Store
         store = Store(args.db)
-        count = generate(store)
+        count, mod_count = generate(store)
         store.flush()
-        print("Wrote %d demo attempts to %s" % (count, args.db))
+        print("Wrote %d demo attempts and %d moderation events to %s" % (count, mod_count, args.db))
         if not args.serve:
             return
     _serve(args.db, args.host, args.port)

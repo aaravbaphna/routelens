@@ -18,7 +18,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dependencies = ["litellm"]
+dependencies = ["litellm", "httpx"]
 
 [project.optional-dependencies]
 # Only needed for `routelens serve` / `routelens demo --serve` run standalone,

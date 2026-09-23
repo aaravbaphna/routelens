@@ -5,8 +5,10 @@ Install with `routelens install --config config.yaml --patch`, which adds:
     litellm_settings:
       callbacks: routelens_callback.instance
 
-The callback never modifies requests or responses, and every hook swallows its
-own errors so it can't break routing.
+By default the callback never modifies requests or responses, and every hook swallows its own
+errors so it can't break routing. The one exception is moderation (see moderation.py and the
+README) -- off unless ROUTELENS_MODERATION is explicitly set, and the only thing here that can
+actually deny a request rather than just record it.
 """
 from __future__ import annotations
 
@@ -20,9 +22,11 @@ import uuid
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
+import litellm
 from litellm.integrations.custom_logger import CustomLogger
 
 from .explain import EXCLUDED_GENERIC, explain
+from .moderation import ModerationChecker
 from .store import Store
 
 log = logging.getLogger("routelens")
@@ -103,6 +107,19 @@ def _last(messages: Optional[List[Dict[str, Any]]], role: str) -> str:
     return ""
 
 
+def _response_text(response: Any) -> str:
+    """The text of a completion response, for output moderation. Defensive about shape: a
+    streaming or malformed response shouldn't ever raise here."""
+    try:
+        choice = response.choices[0]
+        content = getattr(getattr(choice, "message", None), "content", None)
+        if content is None:
+            content = getattr(choice, "text", None)
+        return content or ""
+    except Exception:
+        return ""
+
+
 class RouteLens(CustomLogger):
     def __init__(
         self,
@@ -112,6 +129,10 @@ class RouteLens(CustomLogger):
         infer_sessions: Optional[bool] = None,
         mount: bool = True,
         router: Any = None,
+        moderation_enabled: Optional[bool] = None,
+        moderation_mode: Optional[str] = None,
+        moderation_fail_open: Optional[bool] = None,
+        moderation_checker: Any = None,
     ) -> None:
         super().__init__()
         env = os.environ.get
@@ -127,6 +148,35 @@ class RouteLens(CustomLogger):
         self._traces: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._sdk_reqs: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         _install_complexity_patch()
+
+        # Moderation is off by default: enabling it is what turns RouteLens from a pure observer
+        # into something that can actually deny a request. See moderation.py and the README.
+        enabled = (moderation_enabled if moderation_enabled is not None
+                   else env("ROUTELENS_MODERATION", "0").lower() not in ("0", "false", "no"))
+        self.moderation_mode = (moderation_mode or env("ROUTELENS_MODERATION_MODE", "enforce")).lower()
+        if self.moderation_mode not in ("enforce", "observe"):
+            log.warning("routelens: ROUTELENS_MODERATION_MODE=%r is invalid, defaulting to 'enforce'",
+                        self.moderation_mode)
+            self.moderation_mode = "enforce"
+        self.moderation_fail_open = (
+            moderation_fail_open if moderation_fail_open is not None
+            else env("ROUTELENS_MODERATION_FAIL_OPEN", "1").lower() not in ("0", "false", "no"))
+        self._moderation = None
+        if enabled:
+            checker_kwargs: Dict[str, Any] = {
+                "api_key": env("ROUTELENS_MODERATION_API_KEY") or env("OPENAI_API_KEY"),
+                "timeout_s": float(env("ROUTELENS_MODERATION_TIMEOUT_S", "2.0")),
+            }
+            if env("ROUTELENS_MODERATION_BASE_URL"):  # e.g. a self-hosted, API-compatible endpoint, or a test double
+                checker_kwargs["base_url"] = env("ROUTELENS_MODERATION_BASE_URL")
+            self._moderation = moderation_checker or ModerationChecker(**checker_kwargs)
+            if not self._moderation.enabled:
+                log.warning("routelens: ROUTELENS_MODERATION is on but no API key is set "
+                            "(ROUTELENS_MODERATION_API_KEY or OPENAI_API_KEY) -- moderation will be skipped")
+                self._moderation = None
+            else:
+                log.warning("routelens: moderation enabled (mode=%s)", self.moderation_mode)
+
         if mount:
             self._mount()
 
@@ -143,7 +193,8 @@ class RouteLens(CustomLogger):
         except Exception:
             return
         try:
-            app.include_router(build_router(self.store))
+            app.include_router(build_router(self.store, moderation_enabled=self._moderation is not None,
+                                             moderation_mode=self.moderation_mode))
             log.warning("RouteLens dashboard mounted at /routelens (db: %s)", self.db_path)
         except Exception as e:  # pragma: no cover
             log.error("RouteLens could not mount its dashboard: %r", e)
@@ -216,8 +267,10 @@ class RouteLens(CustomLogger):
 
     # ------------------------------------------------------------------ hooks
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):  # type: ignore[override]
-        """Runs once per HTTP request. LiteLLM's trace id is shared across requests whenever a client
-        sends x-litellm-session-id, so we stamp our own id to tell one turn from the next."""
+        """Runs once per HTTP request, before the model is ever called -- this is where input
+        moderation lives, since it's the only hook that can reject a request before it's billed
+        or answered. Proxy-only (this hook never fires for a bare SDK Router/completion call);
+        see the README for what that means for moderation coverage."""
         try:
             key = "litellm_metadata" if isinstance(data.get("litellm_metadata"), dict) else "metadata"
             if not isinstance(data.get(key), dict):
@@ -225,19 +278,69 @@ class RouteLens(CustomLogger):
             data[key].setdefault("routelens_request_id", uuid.uuid4().hex)
         except Exception as e:
             log.debug("routelens pre_call hook error: %r", e)
+
+        if self._moderation is not None:
+            await self._check_moderation("input", data, _last(data.get("messages"), "user"))
         return None
 
     async def async_post_call_success_deployment_hook(self, request_data, response, call_type):  # type: ignore[override]
         """Runs inline just before the response is returned (unlike the success log, which is a background
-        task), so the next request on a shared trace id can't be mistaken for a retry. Returns None: we never
-        touch the response."""
+        task), so the next request on a shared trace id can't be mistaken for a retry, and so output
+        moderation (which needs to reject the response right here, before the caller sees it) has
+        somewhere to run. Unlike pre_call_hook, this fires for both the proxy and a bare SDK Router."""
         try:
             st = self._sdk_reqs.get(str((request_data or {}).get("litellm_trace_id")))
             if st is not None:
                 st["done"] = True
         except Exception:
             pass
+
+        if self._moderation is not None:
+            await self._check_moderation("output", request_data or {}, _response_text(response))
         return None
+
+    async def _check_moderation(self, chain: str, data: Dict[str, Any], text: str) -> None:
+        """Shared by both hooks: run the checker, record what happened either way, and raise to
+        deny the request if (a) it was flagged and we're enforcing, or (b) the check itself
+        failed and fail_open is off. `litellm.BadRequestError` here propagates out of the hook
+        and becomes the caller's actual response -- verified against a live proxy, not assumed."""
+        text = (text or "").strip()
+        if not text:
+            return
+        md = data.get("metadata") or data.get("litellm_metadata") or {}
+        req_id = str(md.get("routelens_request_id") or uuid.uuid4().hex)
+        try:
+            result = await self._moderation.check(text)
+        except Exception as e:  # the checker itself is defensive, but never trust that fully
+            log.warning("routelens: moderation check raised %r, treating as an error", e)
+            result = None
+
+        if result is None or result.error is not None:
+            status, reason, categories = "error", (result.error if result else "unknown error"), []
+            should_block = not self.moderation_fail_open
+        else:
+            categories = result.categories
+            status = "blocked" if result.flagged else "pass"
+            reason = ("flagged for %s" % ", ".join(categories) if categories else "flagged") \
+                if result.flagged else None
+            should_block = result.flagged and self.moderation_mode == "enforce"
+
+        try:
+            session_id, session_source = self._session({}, md, data.get("messages"))
+        except Exception:
+            session_id, session_source = "req-" + req_id[:10], "none"
+        self.store.record_moderation({
+            "id": uuid.uuid4().hex, "request_id": req_id, "session_id": session_id,
+            "session_source": session_source, "ts": time.time(), "chain": chain, "status": status,
+            "categories": categories, "scores": (result.scores if result else {}), "reason": reason,
+            "latency_ms": (result.latency_ms if result else None),
+            "preview": text[:200] + ("…" if len(text) > 200 else "") if self.capture_content == "preview" else None,
+            "key_alias": md.get("user_api_key_alias") or md.get("user_api_key_team_alias"),
+        })
+        if should_block:
+            message = ("Blocked by RouteLens %s moderation: %s" % (chain, reason)) if status == "blocked" \
+                else ("RouteLens %s moderation check failed and fail_open is off: %s" % (chain, reason))
+            raise litellm.BadRequestError(message=message, model=data.get("model"), llm_provider="")
 
     async def async_filter_deployments(  # type: ignore[override]
         self, model, healthy_deployments, messages, request_kwargs=None, parent_otel_span=None

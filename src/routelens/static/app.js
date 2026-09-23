@@ -140,7 +140,8 @@
     const liveText = h("span", { text: "Connecting" });
     const nav = h("nav", { class: "nav" },
       h("a", { href: "#/", "data-nav": "overview", text: "Overview" }),
-      h("a", { href: "#/sessions", "data-nav": "sessions", text: "Sessions" }));
+      h("a", { href: "#/sessions", "data-nav": "sessions", text: "Sessions" }),
+      h("a", { href: "#/moderation", "data-nav": "moderation", text: "Moderation" }));
     const main = h("main", { id: "view" });
     $app.replaceChildren(
       h("header", { class: "top" },
@@ -166,7 +167,9 @@
     s.themeBtn.replaceChildren(icon(isDark() ? "sun" : "moon", 16));
     const route = parseRoute().name;
     s.nav.querySelectorAll("a").forEach((a) => {
-      const on = (a.dataset.nav === "overview" && route === "overview") || (a.dataset.nav === "sessions" && (route === "sessions" || route === "session"));
+      const on = (a.dataset.nav === "overview" && route === "overview")
+        || (a.dataset.nav === "sessions" && (route === "sessions" || route === "session"))
+        || (a.dataset.nav === "moderation" && route === "moderation");
       on ? a.setAttribute("aria-current", "page") : a.removeAttribute("aria-current");
     });
     s.dot.className = "pulse" + (state.healthy ? "" : " off");
@@ -178,6 +181,7 @@
     const p = (location.hash || "#/").slice(1).split("/").filter(Boolean);
     if (p[0] === "sessions") return { name: "sessions" };
     if (p[0] === "session" && p[1]) return { name: "session", id: decodeURIComponent(p.slice(1).join("/")) };
+    if (p[0] === "moderation") return { name: "moderation" };
     return { name: "overview" };
   }
 
@@ -186,12 +190,24 @@
     const route = parseRoute();
     syncShell();
     try {
+      const meta = await api("/meta");
+      state.providers = meta.providers;
+      state.moderation = meta.moderation;
       let data, view;
       if (route.name === "session") { data = await api("/sessions/" + encodeURIComponent(route.id)); view = viewSession; }
       else if (route.name === "sessions") { data = await api("/sessions?window=" + state.window + "&limit=100" + (state.q ? "&q=" + encodeURIComponent(state.q) : "")); view = viewSessions; }
+      else if (route.name === "moderation") {
+        // Not gated on meta.moderation.enabled: that reflects the *live* callback's setting, but
+        // `routelens serve` (standalone/demo mode) never knows that and would always report
+        // false even when the database has real moderation history -- show data whenever
+        // there's data, exactly like every other page here already does with an empty state.
+        const chain = state.modChain || "all";
+        const [o, r] = await Promise.all([
+          api("/moderation/overview?window=" + state.window + "&chain=" + chain),
+          api("/moderation/recent?limit=14&chain=" + chain)]);
+        data = { o, r, chain, mode: meta.moderation.mode }; view = viewModeration;
+      }
       else { const [o, r] = await Promise.all([api("/overview?window=" + state.window), api("/recent?limit=10")]); data = { o, r }; view = viewOverview; }
-      const meta = await api("/meta");
-      state.providers = meta.providers;
       state.healthy = true; state.updated = Date.now() / 1000;
       const key = route.name + ":" + state.window + ":" + state.q + ":" + JSON.stringify(data);
       if (force || key !== state.lastKey) {
@@ -237,16 +253,18 @@
     r = Math.min(r, w / 2, hgt);
     return "M" + x + "," + (y + hgt) + "V" + (y + r) + "Q" + x + "," + y + " " + (x + r) + "," + y + "H" + (x + w - r) + "Q" + (x + w) + "," + y + " " + (x + w) + "," + (y + r) + "V" + (y + hgt) + "Z";
   }
-  function timeSeries(o) {
+  function timeSeries(o, opts) {
+    opts = opts || {};
+    const badKey = opts.badKey || "failed", badLabel = opts.badLabel || "Failed", totalLabel = opts.totalLabel || "Calls";
     const W = 760, H = 230, m = { l: 40, r: 8, t: 10, b: 26 }, pw = W - m.l - m.r, ph = H - m.t - m.b;
     const step = o.bucket_s, start = Math.floor(o.since / step) * step, end = Math.floor(Date.now() / 1000 / step) * step;
     const n = Math.max(1, Math.round((end - start) / step) + 1);
     const byT = new Map(o.series.map((b) => [b.t, b]));
-    const bins = Array.from({ length: n }, (_, i) => { const t = start + i * step, b = byT.get(t) || { n: 0, failed: 0 }; return { t, n: b.n, failed: b.failed }; });
+    const bins = Array.from({ length: n }, (_, i) => { const t = start + i * step, b = byT.get(t) || { n: 0 }; return { t, n: b.n, bad: b[badKey] || 0 }; });
     const top = niceMax(Math.max(1, ...bins.map((b) => b.n)));
     const slot = pw / n, bw = Math.min(24, Math.max(2, slot - 2));
     const y = (v) => m.t + ph - (v / top) * ph;
-    const svg = sv("svg", { class: "chart", viewBox: "0 0 " + W + " " + H, width: "100%", role: "img", "aria-label": "Model calls over time, with failures" });
+    const svg = sv("svg", { class: "chart", viewBox: "0 0 " + W + " " + H, width: "100%", role: "img", "aria-label": totalLabel + " over time, with " + badLabel.toLowerCase() });
     for (const f of [0, 0.5, 1]) {
       const v = top * f;
       svg.append(sv("line", { class: f === 0 ? "axisline" : "gridline", x1: m.l, x2: W - m.r, y1: y(v), y2: y(v) }),
@@ -256,12 +274,12 @@
     const every = Math.max(1, Math.ceil(n / 6));
     bins.forEach((b, i) => {
       const cx = m.l + slot * i + slot / 2, x = cx - bw / 2;
-      const okN = b.n - b.failed, hOk = (okN / top) * ph, hFail = (b.failed / top) * ph;
+      const okN = b.n - b.bad, hOk = (okN / top) * ph, hBad = (b.bad / top) * ph;
       const g = sv("g");
-      if (okN > 0) g.append(sv("path", { d: roundedTop(x, y(okN), bw, Math.max(1, hOk), b.failed ? 0.01 : 4), fill: "var(--bar)", opacity: 0.55, class: "col" }));
-      if (b.failed > 0) g.append(sv("path", { d: roundedTop(x, y(b.n) , bw, Math.max(2, hFail), 4), fill: "var(--critical)", transform: okN > 0 ? "translate(0,-2)" : null }));
-      const hit = sv("rect", { x: m.l + slot * i, y: m.t, width: slot, height: ph, fill: "transparent", tabindex: 0, "aria-label": fmt(b.t) + ": " + b.n + " calls, " + b.failed + " failed" });
-      attachTip(hit, () => h("div", null, h("b", { text: fmt(b.t) }), tipRow("Calls", h("b", { text: nf.format(b.n) })), tipRow("Failed", h("b", { text: nf.format(b.failed) }))));
+      if (okN > 0) g.append(sv("path", { d: roundedTop(x, y(okN), bw, Math.max(1, hOk), b.bad ? 0.01 : 4), fill: "var(--bar)", opacity: 0.55, class: "col" }));
+      if (b.bad > 0) g.append(sv("path", { d: roundedTop(x, y(b.n) , bw, Math.max(2, hBad), 4), fill: "var(--critical)", transform: okN > 0 ? "translate(0,-2)" : null }));
+      const hit = sv("rect", { x: m.l + slot * i, y: m.t, width: slot, height: ph, fill: "transparent", tabindex: 0, "aria-label": fmt(b.t) + ": " + b.n + " " + totalLabel.toLowerCase() + ", " + b.bad + " " + badLabel.toLowerCase() });
+      attachTip(hit, () => h("div", null, h("b", { text: fmt(b.t) }), tipRow(totalLabel, h("b", { text: nf.format(b.n) })), tipRow(badLabel, h("b", { text: nf.format(b.bad) }))));
       g.append(hit); svg.append(g);
       if (i % every === 0) svg.append(sv("text", { x: cx, y: H - 6, "text-anchor": "middle" }, fmt(b.t)));
     });
@@ -322,6 +340,70 @@
   }
   function go(hash) { location.hash = hash; }
 
+  /* ---------------------------------------------------------------- moderation */
+  const MOD_STATUS = {
+    pass: ["ok", "check", "Passed"], blocked: ["fail", "x", "Blocked"], error: ["warn", "alert", "Check failed"],
+  };
+  function modStatusBadge(status) {
+    const [cls, ic, label] = MOD_STATUS[status] || ["warn", "alert", status];
+    return h("span", { class: "status " + cls }, icon(ic, 13), label);
+  }
+  function chainChip(chain) {
+    return h("span", { class: "chip", style: { textTransform: "capitalize" }, text: chain });
+  }
+
+  function viewModeration(data, route) {
+    const head = h("div", { class: "pagehead" }, h("div", null, h("h1", { text: "Moderation" }),
+      h("p", { text: "Every prompt and response checked against a moderation filter, and what happened to it." })),
+      data.mode ? h("span", { class: "chip", title: "Set by ROUTELENS_MODERATION_MODE", text: "mode: " + data.mode }) : null);
+    const { o, r } = data;
+    const seg = h("div", { class: "seg", role: "group", "aria-label": "Filter by chain" },
+      ["all", "input", "output"].map((c) => h("button", {
+        "aria-pressed": String(c === data.chain),
+        onclick: () => { state.modChain = c; state.lastKey = ""; refresh(); },
+      }, c === "all" ? "All" : c[0].toUpperCase() + c.slice(1))));
+    const t = o.totals;
+    if (!t.checked) {
+      return h("div", null, head, seg, h("div", { class: "card empty", style: { marginTop: "16px" } },
+        h("h2", { text: "No checks yet" }),
+        h("p", { text: "Send a request through your proxy and moderation results will show up here." }),
+        h("p", { class: "muted", style: { marginTop: "10px" } },
+          "Moderation is off by default -- set ", h("code", { text: "ROUTELENS_MODERATION=1" }),
+          " and an API key (", h("code", { text: "OPENAI_API_KEY" }), " or ",
+          h("code", { text: "ROUTELENS_MODERATION_API_KEY" }), ") to turn it on. Try ",
+          h("code", { text: "ROUTELENS_MODERATION_MODE=observe" }),
+          " first to see what it would catch before anything is actually blocked.")));
+    }
+    const feed = h("ul", { class: "feed" }, r.events.map((e) =>
+      h("li", { tabindex: 0, role: "link", onclick: () => go("#/session/" + encodeURIComponent(e.session_id)),
+                onkeydown: (ev) => { if (ev.key === "Enter") go("#/session/" + encodeURIComponent(e.session_id)); } },
+        h("div", { class: "t tnum mono", text: clock(e.ts) }),
+        h("div", null,
+          h("div", { class: "line" }, chainChip(e.chain), modStatusBadge(e.status),
+            e.categories && e.categories.length ? e.categories.map((c) => h("span", { class: "chip", text: c })) : null,
+            h("span", { class: "muted mono", text: shortId(e.session_id) })),
+          e.preview ? h("div", { class: "why", text: "“" + e.preview + "”" }) : null))));
+    return h("div", null, head,
+      h("div", { style: { marginBottom: "16px" } }, seg),
+      h("div", { class: "grid g-tiles" },
+        tile("Checked", compact(t.checked), "across " + (data.chain === "all" ? "input + output" : data.chain), true),
+        tile("Blocked", (t.block_rate * 100).toFixed(t.block_rate * 100 < 10 ? 1 : 0) + "%", nf.format(t.blocked) + " of " + nf.format(t.checked)),
+        tile("Check failures", nf.format(t.errors), t.checked ? ((t.errors / t.checked) * 100).toFixed(1) + "% of checks" : ""),
+        tile("Avg. check latency", ms(t.avg_latency_ms), "moderation API only")),
+      h("div", { class: "grid g-2", style: { marginTop: "16px" } },
+        h("div", { class: "card" }, h("header", null, h("h2", { text: "Checks over time" }),
+          h("div", { class: "legend" }, h("span", null, h("i", { class: "dot", style: { background: "var(--bar)", opacity: 0.55 } }), "Passed"),
+            h("span", null, h("i", { class: "dot", style: { background: "var(--critical)" } }), "Blocked"))),
+          h("div", { class: "body" }, timeSeries(o, { badKey: "blocked", badLabel: "Blocked", totalLabel: "Checked" }))),
+        h("div", { class: "card" }, h("header", null, h("h2", { text: "Blocked by category" })),
+          h("div", { class: "body" }, o.by_category.length
+            ? barRows(o.by_category.map((c) => ({ n: c.n, label: c.category })),
+                (it, total) => nf.format(it.n), (it) => it.label, () => "var(--critical)", "plain")
+            : h("p", { class: "muted", text: "Nothing blocked in this window." })))),
+      h("div", { class: "card", style: { marginTop: "16px" } },
+        h("header", null, h("h2", { text: "Recent checks" })), h("div", { class: "body" }, feed)));
+  }
+
   /* ---------------------------------------------------------------- sessions list */
   function viewSessions({ sessions }) {
     const search = h("input", { type: "search", placeholder: "Search sessions, models, prompts", value: state.q, "aria-label": "Search sessions" });
@@ -347,8 +429,14 @@
   }
   function ribbon(path, big, extra) {
     return h("div", { class: "ribbon" + (big ? " big" : "") }, path.map((p, i) => {
-      const seg = h("i", { style: { background: provColor(p.provider), opacity: p.status === "success" ? 1 : 0.4 }, tabindex: big ? 0 : null, "aria-label": "Turn " + (i + 1) + ": " + p.model });
-      attachTip(seg, () => h("div", null, h("b", { text: "Turn " + (i + 1) }), tipRow("Model", p.model), tipRow("Provider", p.provider), extra && extra[i] ? h("div", { class: "ink2", style: { marginTop: "4px" }, text: extra[i] }) : null));
+      const blocked = p.status === "blocked" && !p.model;  // blocked before a model was ever picked
+      const seg = h("i", {
+        style: { background: blocked ? "var(--critical)" : provColor(p.provider), opacity: p.status === "success" ? 1 : (blocked ? 0.85 : 0.4) },
+        tabindex: big ? 0 : null, "aria-label": "Turn " + (i + 1) + ": " + (blocked ? "blocked" : p.model),
+      });
+      attachTip(seg, () => h("div", null, h("b", { text: "Turn " + (i + 1) }),
+        blocked ? tipRow("Status", h("b", { text: "Blocked" })) : [tipRow("Model", p.model), tipRow("Provider", p.provider)],
+        extra && extra[i] ? h("div", { class: "ink2", style: { marginTop: "4px" }, text: extra[i] }) : null));
       return seg;
     }));
   }
@@ -356,12 +444,17 @@
   /* ---------------------------------------------------------------- session detail */
   function viewSession(data) {
     const turns = data.turns;
-    const path = turns.map((t) => ({ provider: t.final.provider, model: t.final.model, status: t.status }));
+    // A turn blocked before reaching a model has no `final` -- represent it in the ribbon the
+    // same way store.sessions() already does, rather than crashing on t.final.provider.
+    const path = turns.map((t) => t.final
+      ? { provider: t.final.provider, model: t.final.model, status: t.status }
+      : { provider: null, model: null, status: "blocked" });
     const switches = path.filter((p, i) => i && p.model !== path[i - 1].model).length;
+    const blocked = turns.filter((t) => t.status === "blocked").length;
     const rerouted = turns.filter((t) => t.attempts.length > 1).length;
     const cost = turns.reduce((a, t) => a + (t.cost || 0), 0);
     const dur = turns.length > 1 ? turns[turns.length - 1].ts - turns[0].ts : 0;
-    const provs = [...new Set(path.map((p) => p.provider))];
+    const provs = [...new Set(path.map((p) => p.provider).filter(Boolean))];
     const markers = h("div", { class: "ribbon big", style: { marginTop: "6px", minHeight: "16px" } }, turns.map((t) =>
       h("span", { style: { flex: "1 1 0", display: "flex", justifyContent: "center", color: "var(--serious)" }, title: t.attempts.length > 1 ? "Rerouted: " + t.attempts.length + " attempts" : null }, t.attempts.length > 1 ? icon("alert", 14) : null)));
     return h("div", null,
@@ -372,23 +465,56 @@
           h("span", { class: "chip", text: switches + (switches === 1 ? " model switch" : " model switches") }),
           h("span", { class: "chip", text: rerouted + " rerouted" }), h("span", { class: "chip", text: money(cost) + " spend" }),
           dur ? h("span", { class: "chip", text: span(dur) + " long" }) : null,
+          blocked ? h("span", { class: "chip", style: { color: "var(--critical)" }, text: blocked + " blocked" }) : null,
           data.session_source === "inferred" ? h("span", { class: "chip", title: "No session id was sent. Turns were grouped by matching the first user message and API key. Send x-litellm-session-id for exact grouping.", text: "grouped automatically" }) : null))),
       h("div", { class: "card" }, h("header", null, h("h2", { text: "Route by turn" }),
         h("div", { class: "legend" }, provs.map((p) => h("span", null, dotFor(p), p)), rerouted ? h("span", { style: { color: "var(--ink-2)" } }, h("span", { style: { color: "var(--serious)", display: "inline-flex" } }, icon("alert", 13)), "Fallback or retry") : null)),
-        h("div", { class: "body" }, ribbon(path, true, turns.map((t) => plain(t.final.reason))), markers,
+        h("div", { class: "body" }, ribbon(path, true, turns.map((t) => t.final ? plain(t.final.reason) : "Blocked by moderation")), markers,
           h("div", { class: "ribbon big", style: { marginTop: "4px", alignItems: "flex-start" } }, turns.map((t, i) => {
             const showModel = turns.length <= 12, switched = i > 0 && path[i - 1].model !== path[i].model;
             return h("span", { style: { flex: "1 1 0", minWidth: 0, textAlign: "center", fontSize: "11.5px", lineHeight: "1.35" } },
               h("div", { class: "muted tnum", text: turns.length > 24 && t.turn % 5 ? "" : "T" + t.turn }),
-              showModel ? h("div", { class: switched ? "" : "muted", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: switched ? "var(--ink)" : null, fontWeight: switched ? "600" : "400" }, title: path[i].model, text: path[i].model }) : null);
+              showModel ? h("div", { class: switched ? "" : "muted", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: path[i].model ? (switched ? "var(--ink)" : null) : "var(--critical)", fontWeight: switched ? "600" : "400" }, title: path[i].model || "Blocked", text: path[i].model || "Blocked" }) : null);
           })))),
       h("div", { class: "turns" }, turns.map((t, i) => turnCard(t, i ? turns[i - 1] : null))));
   }
 
+  function modCol(label, ev) {
+    if (!ev) return h("div", { class: "col" }, h("h3", { text: label }),
+      h("p", { class: "muted", style: { margin: 0, fontSize: "12.5px" } }, "not checked"));
+    return h("div", { class: "col" }, h("h3", { text: label }), modStatusBadge(ev.status),
+      ev.categories && ev.categories.length ? h("div", { class: "details", style: { marginTop: "6px" } },
+        ev.categories.map((c) => h("span", { class: "chip", text: c }))) : null,
+      ev.reason && ev.status !== "pass" ? h("div", { class: "why muted", style: { fontSize: "11.5px", marginTop: "4px" } }, ev.reason) : null,
+      h("div", { class: "muted tnum", style: { fontSize: "11px", marginTop: "4px" }, text: ms(ev.latency_ms) }));
+  }
+  function moderationFlowRow(modIn, modelNode, modOut) {
+    return h("div", { class: "flow" }, modCol("Input filter", modIn), h("div", { class: "arrow" }, icon("arrow", 16)),
+      modelNode ? h("div", { class: "col" }, h("h3", { text: "Model" }), modelNode)
+                : h("div", { class: "col" }, h("h3", { text: "Model" }), h("p", { class: "muted", style: { margin: 0, fontSize: "12.5px" } }, "never reached")),
+      h("div", { class: "arrow" }, icon("arrow", 16)), modCol("Output filter", modOut));
+  }
+
   function turnCard(t, prev) {
     const f = t.final, multi = t.attempts.length > 1;
-    const switched = prev && prev.final.model !== f.model;
+    const modIn = t.moderation && t.moderation.input, modOut = t.moderation && t.moderation.output;
     const key = data_key(t);
+
+    if (!f) {
+      // Blocked before any model was ever called -- there is no routing decision to show, so
+      // this renders a deliberately different (much shorter) card, not a half-filled normal one.
+      return h("div", { class: "turn" },
+        h("div", { class: "rail" }, h("div", { class: "n tnum", text: t.turn })),
+        h("div", { class: "card" },
+          h("div", { class: "head" }, h("span", { class: "status fail" }, icon("x", 13), "Blocked"),
+            h("span", { class: "chip", text: "input moderation" }),
+            h("div", { class: "stats tnum" }, h("span", { class: "muted", text: clock(t.ts) }))),
+          t.preview ? h("blockquote", { class: "quote", text: t.preview }) : null,
+          h("p", { class: "headline", text: (modIn && modIn.reason) || "Blocked before reaching a model" }),
+          moderationFlowRow(modIn, null, null)));
+    }
+
+    const switched = prev && prev.final && prev.final.model !== f.model;
     const open = state.opened.has(key) ? state.opened.get(key) : (multi || switched);
     const det = h("details", { class: "path", open: open || null });
     det.addEventListener("toggle", () => { state.opened.set(key, det.open); });
@@ -396,13 +522,14 @@
     return h("div", { class: "turn" },
       h("div", { class: "rail" }, h("div", { class: "n tnum", text: t.turn })),
       h("div", { class: "card" },
-        h("div", { class: "head" }, modelChip(f.provider, f.model, true), statusBadge(t.status),
+        h("div", { class: "head" }, modelChip(f.provider, f.model, true), statusBadge(t.status, t.status === "blocked" ? "Blocked" : null),
           h("span", { class: "chip", title: (KINDS[f.reason_kind] || [])[1] || "", text: kindLabel(f.reason_kind) }),
           switched ? h("span", { class: "chip", title: "Different model than the previous turn" }, icon("arrow", 12), "from " + prev.final.model) : null,
           h("div", { class: "stats tnum" }, h("span", { text: ms(t.latency_ms) }), h("span", { text: nf.format(f.prompt_tokens) + " → " + nf.format(f.completion_tokens) + " tok" }), h("span", { text: money(t.cost) }), h("span", { class: "muted", text: clock(t.ts) }))),
         t.preview ? h("blockquote", { class: "quote", text: t.preview }) : null,
         h("p", { class: "headline" }, rich(f.reason)),
         f.reason_detail && f.reason_detail.length ? h("div", { class: "details" }, f.reason_detail.map((d) => h("span", { class: "chip", text: d }))) : null,
+        (modIn || modOut) ? moderationFlowRow(modIn, modelChip(f.provider, f.model, false), modOut) : null,
         det));
   }
   const data_key = (t) => t.request_id;
